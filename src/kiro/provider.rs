@@ -14,6 +14,7 @@ use tokio::time::sleep;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext, is_quota_exceeded};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
@@ -106,6 +107,15 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 查询所有启用凭据的真实上游模型目录。
+    ///
+    /// 该目录仅用于 `/v1/models` 展示，不用于拦截消息请求。
+    pub async fn discover_available_models(
+        &self,
+    ) -> anyhow::Result<ListAvailableModelsResponse> {
+        self.token_manager.discover_available_models().await
     }
 
     /// 发送非流式 API 请求

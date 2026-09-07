@@ -71,13 +71,9 @@ fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// GET /v1/models
-///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
-
-    let models = vec![
+/// 静态模型列表，仅在上游模型发现不可用时回退。
+fn fallback_models() -> Vec<Model> {
+    vec![
         Model {
             id: "claude-opus-5".to_string(),
             object: "model".to_string(),
@@ -240,7 +236,54 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
+    ]
+}
+
+fn upstream_model_to_api(model: crate::kiro::model::available_models::UpstreamModel) -> Model {
+    let max_tokens = model
+        .token_limits
+        .and_then(|limits| limits.max_input_tokens)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(32_000);
+    let display_name = model
+        .model_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| model.model_id.clone());
+
+    Model {
+        id: model.model_id,
+        object: "model".to_string(),
+        created: 0,
+        owned_by: "kiro".to_string(),
+        display_name,
+        model_type: "chat".to_string(),
+        max_tokens,
+    }
+}
+
+/// GET /v1/models
+///
+/// 优先返回所有启用凭据从 Kiro 实时发现的模型；发现失败时回退静态列表。
+/// 该列表只用于展示，不作为消息请求的本地白名单。
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+    tracing::info!("Received GET /v1/models request");
+
+    let models = if let Some(provider) = &state.kiro_provider {
+        match provider.discover_available_models().await {
+            Ok(response) => response
+                .models
+                .into_iter()
+                .map(upstream_model_to_api)
+                .collect(),
+            Err(error) => {
+                tracing::warn!(error = %error, "上游模型发现失败，回退静态模型列表");
+                fallback_models()
+            }
+        }
+    } else {
+        tracing::warn!("KiroProvider 未配置，回退静态模型列表");
+        fallback_models()
+    };
 
     Json(ModelsResponse {
         object: "list".to_string(),

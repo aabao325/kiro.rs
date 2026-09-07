@@ -88,7 +88,7 @@ pub fn map_model(model: &str) -> Option<String> {
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
         } else {
-            None
+            Some(model.to_string())
         }
     } else if model_lower.contains("opus") {
         if model_lower.contains("opus-5") {
@@ -102,12 +102,16 @@ pub fn map_model(model: &str) -> Option<String> {
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else {
-            None
+            Some(model.to_string())
         }
     } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
+        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+            Some("claude-haiku-4.5".to_string())
+        } else {
+            Some(model.to_string())
+        }
     } else {
-        None
+        Some(model.to_string())
     }
 }
 
@@ -135,15 +139,16 @@ pub struct ConversionResult {
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
+    /// 保留兼容错误类型；开放透传后转换器不再产生此错误。
     UnsupportedModel(String),
     EmptyMessages,
 }
 
 impl std::fmt::Display for ConversionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
-            ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::UnsupportedModel(model) => write!(formatter, "模型不支持: {}", model),
+            ConversionError::EmptyMessages => write!(formatter, "消息列表为空"),
         }
     }
 }
@@ -224,9 +229,8 @@ fn create_placeholder_tool(name: &str) -> Tool {
 
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
-    // 1. 映射模型
-    let model_id = map_model(&req.model)
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    // 1. 映射已知模型别名；未知模型原样透传给上游
+    let model_id = map_model(&req.model).unwrap_or_else(|| req.model.clone());
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -935,8 +939,16 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+    fn test_map_model_unknown_passthrough() {
+        assert_eq!(map_model("gpt-4"), Some("gpt-4".to_string()));
+        assert_eq!(
+            map_model("future-model-v9"),
+            Some("future-model-v9".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-9-preview"),
+            Some("claude-sonnet-9-preview".to_string())
+        );
     }
 
     #[test]

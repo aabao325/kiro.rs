@@ -18,6 +18,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -330,6 +331,75 @@ fn usage_limits_url(host: &str) -> String {
     format!(
         "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
+    )
+}
+
+fn model_api_region_candidates(credentials: &KiroCredentials, config: &Config) -> [&'static str; 2] {
+    if credentials.effective_auth_region(config).starts_with("eu-") {
+        ["eu-central-1", "us-east-1"]
+    } else {
+        ["us-east-1", "eu-central-1"]
+    }
+}
+
+fn available_models_url(host: &str) -> String {
+    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+}
+
+/// 获取指定凭据当前可用的模型列表。
+///
+/// 此目录仅用于模型发现与展示，不参与消息请求的白名单校验。
+pub(crate) async fn get_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableModelsResponse> {
+    let regions = model_api_region_candidates(credentials, config);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = USAGE_API_KIRO_VERSION;
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut last_error = None;
+
+    for (index, region) in regions.iter().enumerate() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let mut request = client
+            .get(available_models_url(&host))
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close");
+
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.json().await?);
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        last_error = Some(format!("{} {}", status, body));
+        if status.as_u16() == 403 && index + 1 < regions.len() {
+            tracing::debug!(region = %region, "模型列表查询返回 403，尝试备用区域");
+            continue;
+        }
+        bail!("获取可用模型失败: {}", last_error.unwrap());
+    }
+
+    bail!(
+        "获取可用模型失败: {}",
+        last_error.unwrap_or_else(|| "无可用模型端点".to_string())
     )
 }
 
@@ -1647,6 +1717,79 @@ impl MultiTokenManager {
         }
 
         Ok(usage_limits)
+    }
+
+    /// 获取指定凭据当前可用的模型列表。
+    pub async fn get_available_models_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<ListAvailableModelsResponse> {
+        let ctx = self.acquire_context_for_id(id).await?;
+        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
+        get_available_models(
+            &ctx.credentials,
+            &self.config,
+            &ctx.token,
+            effective_proxy.as_ref(),
+        )
+        .await
+    }
+
+    /// 实时聚合所有启用凭据的模型目录。
+    ///
+    /// 单张凭据失败不会阻断其他凭据；只有全部查询失败时才返回错误。
+    pub async fn discover_available_models(&self) -> anyhow::Result<ListAvailableModelsResponse> {
+        let ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .map(|entry| entry.id)
+                .collect()
+        };
+        if ids.is_empty() {
+            anyhow::bail!("没有可用凭据用于模型发现");
+        }
+
+        let mut models = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut errors = Vec::new();
+        for id in ids {
+            match self.get_available_models_for(id).await {
+                Ok(response) => {
+                    for model in response.models {
+                        if seen.insert(model.model_id.to_ascii_lowercase()) {
+                            models.push(model);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(credential_id = id, error = %error, "凭据模型列表查询失败");
+                    errors.push(format!("#{}: {}", id, error));
+                }
+            }
+        }
+
+        if models.is_empty() && !errors.is_empty() {
+            anyhow::bail!("所有凭据的模型列表查询均失败: {}", errors.join("; "));
+        }
+        models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+        Ok(ListAvailableModelsResponse { models })
+    }
+
+    async fn acquire_context_for_id(&self, id: u64) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.disabled {
+                anyhow::bail!("凭据已禁用: {}", id);
+            }
+            entry.credentials.clone()
+        };
+        self.try_ensure_token(id, &credentials).await
     }
 
     /// 添加新凭据（Admin API）
