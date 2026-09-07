@@ -25,6 +25,10 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
+/// 用量 REST 接口固定使用的兼容版本。
+/// 新版 User-Agent 会要求 profileArn，但该参数会使旧版额度接口拒绝部分有效凭据。
+const USAGE_API_KIRO_VERSION: &str = "0.9.2";
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -319,6 +323,16 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 构造额度查询 URL。
+///
+/// profileArn 只用于流式聊天端点；getUsageLimits 携带它会被兼容接口判为非法。
+fn usage_limits_url(host: &str) -> String {
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    )
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -332,20 +346,13 @@ pub(crate) async fn get_usage_limits(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    // getUsageLimits 是旧版兼容 REST 接口。新版 User-Agent 会要求 profileArn，
+    // 但该参数会让 Enterprise/IdC 等有效凭据被接口判为 Invalid profileArn。
+    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
-    );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
+    let url = usage_limits_url(&host);
 
     // 构建 User-Agent headers
     let user_agent = format!(
@@ -1989,6 +1996,16 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_usage_limits_url_omits_profile_arn() {
+        let url = usage_limits_url("q.us-east-1.amazonaws.com");
+        assert_eq!(
+            url,
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+        );
+        assert!(!url.contains("profileArn"));
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
