@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::cache_sim::{CacheSimSettings, CacheSimStore};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, QuotaKeywordsResponse,
+    SetLoadBalancingModeRequest, SetQuotaKeywordsRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -38,12 +40,15 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 缓存 usage 模拟设置存储（与 anthropic 消息处理器共享）
+    cache_sim: Arc<CacheSimStore>,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        cache_sim: Arc<CacheSimStore>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -56,7 +61,18 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            cache_sim,
         }
+    }
+
+    /// 获取缓存 usage 模拟设置
+    pub fn get_cache_sim(&self) -> CacheSimSettings {
+        self.cache_sim.snapshot()
+    }
+
+    /// 设置缓存 usage 模拟设置（clamp + 持久化），返回最终生效的设置
+    pub fn set_cache_sim(&self, settings: CacheSimSettings) -> CacheSimSettings {
+        self.cache_sim.update(settings)
     }
 
     /// 获取所有凭据状态
@@ -305,6 +321,26 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 获取额度用尽判定关键词
+    pub fn get_quota_keywords(&self) -> QuotaKeywordsResponse {
+        QuotaKeywordsResponse {
+            keywords: self.token_manager.get_quota_exceeded_keywords(),
+        }
+    }
+
+    /// 设置额度用尽判定关键词
+    pub fn set_quota_keywords(
+        &self,
+        req: SetQuotaKeywordsRequest,
+    ) -> Result<QuotaKeywordsResponse, AdminServiceError> {
+        let keywords = self
+            .token_manager
+            .set_quota_exceeded_keywords(req.keywords)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(QuotaKeywordsResponse { keywords })
     }
 
     // ============ 余额缓存持久化 ============

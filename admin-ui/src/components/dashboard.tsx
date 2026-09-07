@@ -12,6 +12,8 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { CacheSimCard } from '@/components/cache-sim-card'
+import { QuotaKeywordsCard } from '@/components/quota-keywords-card'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -744,6 +746,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </>
           )}
+
+          {/* 缓存 usage 模拟设置 */}
+          <CacheSimCard />
+
+          {/* 额度用尽判定关键词设置 */}
+          <QuotaKeywordsCard />
         </div>
       </main>
 

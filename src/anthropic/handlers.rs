@@ -19,13 +19,17 @@ use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
-use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, SseEvent, StreamContext, generate_message_id};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+use crate::model::cache_sim::{self, CacheSimSettings, CacheTtl};
+
+/// 缓存模拟上下文：当请求带 cache_control 时为 Some((设置快照, TTL)）。
+/// 即使为 Some，若设置未启用，simulate 仍返回 None。
+type CacheSimCtx = Option<(CacheSimSettings, CacheTtl)>;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -213,8 +217,26 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(raw): JsonExtractor<serde_json::Value>,
 ) -> Response {
+    // 在反序列化前探测 cache_control / TTL（结构丢失前）
+    let cache_ttl = cache_sim::detect_cache_ttl(&raw);
+
+    let mut payload: MessagesRequest = match serde_json::from_value(raw) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("请求体反序列化失败: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("请求体格式错误: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -222,6 +244,10 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+
+    // 缓存模拟上下文：请求带 cache_control 时携带设置快照 + TTL
+    let cache_sim_ctx: CacheSimCtx = cache_ttl.map(|ttl| (state.cache_sim.snapshot(), ttl));
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -253,7 +279,8 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_sim_ctx)
+            .await;
     }
 
     // 转换请求
@@ -326,12 +353,22 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_sim_ctx,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_sim_ctx,
+        )
+        .await
     }
 }
 
@@ -343,6 +380,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_sim_ctx: CacheSimCtx,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -352,6 +390,7 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.cache_sim = cache_sim_ctx;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -469,8 +508,6 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-use super::converter::get_context_window_size;
-
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -479,6 +516,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_sim_ctx: CacheSimCtx,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -512,8 +550,6 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -565,21 +601,15 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                            // 仅用于检测上下文窗口是否已满；input_tokens 仍上报本地估算值。
+                            // contextUsageEvent 的百分比包含 Kiro 内置系统提示词等代理外内容，
+                            // 直接换算会让 input_tokens 虚高，与 Claude API 语义（仅用户输入）不符。
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                "收到 contextUsageEvent: {}%（仅用于窗口判满，input_tokens 用本地估算）",
+                                context_usage.context_usage_percentage
                             );
                         }
                         Event::Exception { exception_type, .. } => {
@@ -604,6 +634,8 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
+    // 统计 thinking tokens（用于 usage.output_tokens_details.thinking_tokens）
+    let mut thinking_tokens: i32 = 0;
 
     if thinking_enabled {
         // 从完整文本中提取 thinking 块
@@ -611,6 +643,9 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if let Some(thinking_text) = thinking {
+            // 统计 thinking token（与 output 估算口径一致，约 4 字符/token）
+            thinking_tokens = ((thinking_text.len() as i32) + 3) / 4;
+            // 注：按用户要求省略 signature 字段
             content.push(json!({
                 "type": "thinking",
                 "thinking": thinking_text
@@ -635,21 +670,58 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // input_tokens 上报本地估算值（仅用户输入），不被 contextUsageEvent 覆盖
+    let final_input_tokens = input_tokens;
 
-    // 构建 Anthropic 响应
+    // 构建 usage：缓存字段永远输出（未命中为 0），对齐官方响应结构。
+    // 若启用了缓存模拟且命中，则用模拟结果覆写对应字段。
+    let cache_usage = cache_sim_ctx
+        .as_ref()
+        .and_then(|(settings, ttl)| cache_sim::simulate(settings, *ttl, final_input_tokens));
+
+    let mut usage = if let Some(cache_usage) = &cache_usage {
+        // 命中模拟：input_tokens 被拆分覆写，缓存字段由 apply_to_usage 注入
+        let mut u = json!({ "output_tokens": output_tokens });
+        cache_usage.apply_to_usage(&mut u);
+        u
+    } else {
+        // 未命中或未开启：缓存字段全为 0，保留完整结构
+        json!({
+            "input_tokens": final_input_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": output_tokens
+        })
+    };
+
+    // 补齐官方 usage 中的附加字段
+    if let Some(obj) = usage.as_object_mut() {
+        obj.insert(
+            "output_tokens_details".to_string(),
+            json!({ "thinking_tokens": thinking_tokens }),
+        );
+        obj.insert("service_tier".to_string(), json!("standard"));
+        obj.insert("inference_geo".to_string(), json!("not_available"));
+    }
+
+    // 构建 Anthropic 响应（对齐官方完整结构）
     let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "id": generate_message_id(),
         "type": "message",
         "role": "assistant",
         "content": content,
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+        "stop_details": null,
+        "usage": usage,
+        "diagnostics": null,
+        "context_management": {
+            "applied_edits": []
         }
     });
 
@@ -725,8 +797,26 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(raw): JsonExtractor<serde_json::Value>,
 ) -> Response {
+    // 在反序列化前探测 cache_control / TTL
+    let cache_ttl = cache_sim::detect_cache_ttl(&raw);
+
+    let mut payload: MessagesRequest = match serde_json::from_value(raw) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("请求体反序列化失败: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("请求体格式错误: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -734,6 +824,9 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+
+    // 缓存模拟上下文
+    let cache_sim_ctx: CacheSimCtx = cache_ttl.map(|ttl| (state.cache_sim.snapshot(), ttl));
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -766,7 +859,8 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_sim_ctx)
+            .await;
     }
 
     // 转换请求
@@ -839,12 +933,22 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_sim_ctx,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_sim_ctx,
+        )
+        .await
     }
 }
 
@@ -859,6 +963,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_sim_ctx: CacheSimCtx,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -867,7 +972,8 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_cache_sim(cache_sim_ctx);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

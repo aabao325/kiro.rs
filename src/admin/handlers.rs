@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, CacheSimSettings, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetQuotaKeywordsRequest, SuccessResponse,
     },
 };
 
@@ -136,6 +136,39 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-simulation
+/// 获取缓存 usage 模拟设置
+pub async fn get_cache_simulation(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_sim())
+}
+
+/// PUT /api/admin/config/cache-simulation
+/// 设置缓存 usage 模拟设置（比例自动 clamp 到 [0,1] 并持久化）
+pub async fn set_cache_simulation(
+    State(state): State<AdminState>,
+    Json(payload): Json<CacheSimSettings>,
+) -> impl IntoResponse {
+    Json(state.service.set_cache_sim(payload))
+}
+
+/// GET /api/admin/config/quota-keywords
+/// 获取额度用尽判定关键词
+pub async fn get_quota_keywords(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_quota_keywords())
+}
+
+/// PUT /api/admin/config/quota-keywords
+/// 设置额度用尽判定关键词
+pub async fn set_quota_keywords(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetQuotaKeywordsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_quota_keywords(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

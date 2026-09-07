@@ -196,6 +196,34 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 额度用尽判定关键词 ============
+
+/// 额度用尽判定关键词响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaKeywordsResponse {
+    /// 当前生效的关键词列表
+    pub keywords: Vec<String>,
+}
+
+/// 设置额度用尽判定关键词请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetQuotaKeywordsRequest {
+    /// 新的关键词列表（后端会去除空白/空项/重复项）
+    pub keywords: Vec<String>,
+}
+
+// ============ 缓存 usage 模拟配置 ============
+
+/// 缓存模拟设置（请求 / 响应共用 CacheSimSettings，camelCase 字段）
+///
+/// - `enabled`：是否启用模拟
+/// - `creationRatio`：cache_creation 占可缓存基数比例 [0,1]
+/// - `hitRatio`：cache_read 占可缓存基数比例 [0,1]
+/// - `cacheableRatio`：prompt 中算可缓存基数的比例 [0,1]
+pub use crate::model::cache_sim::CacheSimSettings;
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

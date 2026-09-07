@@ -45,11 +45,6 @@ pub trait KiroEndpoint: Send + Sync {
         body.to_string()
     }
 
-    /// 判断响应体是否表示"月度配额用尽"（禁用凭据并转移）
-    fn is_monthly_request_limit(&self, body: &str) -> bool {
-        default_is_monthly_request_limit(body)
-    }
-
     /// 判断响应体是否表示"上游 bearer token 失效"（触发强制刷新）
     fn is_bearer_token_invalid(&self, body: &str) -> bool {
         default_is_bearer_token_invalid(body)
@@ -70,30 +65,15 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
-/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
+/// 判断响应体是否表示"额度用尽"（禁用凭据并转移）
 ///
-/// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
-pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    if body.contains("MONTHLY_REQUEST_COUNT") {
-        return true;
-    }
-
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-        return false;
-    };
-
-    if value
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
-    {
-        return true;
-    }
-
-    value
-        .pointer("/error/reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+/// 采用配置驱动的关键词子串匹配（大小写敏感），而非结构化解析固定字段，
+/// 以应对官方随时可能更改的错误 reason 值。关键词列表可在 Admin UI 中增删，
+/// 详见 [`Config::quota_exceeded_keywords`](crate::model::config::Config::quota_exceeded_keywords)。
+pub fn is_quota_exceeded(body: &str, keywords: &[String]) -> bool {
+    keywords
+        .iter()
+        .any(|k| !k.is_empty() && body.contains(k.as_str()))
 }
 
 /// 默认的 bearer token 失效判断逻辑
@@ -106,21 +86,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_monthly_request_limit_detects_reason() {
+    fn test_is_quota_exceeded_detects_default_keyword() {
         let body = r#"{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
-        assert!(default_is_monthly_request_limit(body));
+        let keywords = vec!["MONTHLY_REQUEST_COUNT".to_string()];
+        assert!(is_quota_exceeded(body, &keywords));
     }
 
     #[test]
-    fn test_default_monthly_request_limit_nested_reason() {
-        let body = r#"{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}"#;
-        assert!(default_is_monthly_request_limit(body));
+    fn test_is_quota_exceeded_detects_custom_keyword() {
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        let keywords = vec![
+            "MONTHLY_REQUEST_COUNT".to_string(),
+            "OVERAGE_REQUEST_LIMIT_EXCEEDED".to_string(),
+        ];
+        assert!(is_quota_exceeded(body, &keywords));
     }
 
     #[test]
-    fn test_default_monthly_request_limit_false() {
+    fn test_is_quota_exceeded_false_when_no_match() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
-        assert!(!default_is_monthly_request_limit(body));
+        let keywords = vec!["MONTHLY_REQUEST_COUNT".to_string()];
+        assert!(!is_quota_exceeded(body, &keywords));
+    }
+
+    #[test]
+    fn test_is_quota_exceeded_empty_keywords_never_matches() {
+        let body = r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#;
+        assert!(!is_quota_exceeded(body, &[]));
     }
 
     #[test]

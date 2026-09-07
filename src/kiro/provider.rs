@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::endpoint::{KiroEndpoint, RequestContext, is_quota_exceeded};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -202,7 +202,9 @@ impl KiroProvider {
             let body = response.text().await.unwrap_or_default();
 
             // 402 额度用尽
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            if status.as_u16() == 402
+                && is_quota_exceeded(&body, &self.token_manager.get_quota_exceeded_keywords())
+            {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -361,7 +363,9 @@ impl KiroProvider {
             let body = response.text().await.unwrap_or_default();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            if status.as_u16() == 402
+                && is_quota_exceeded(&body, &self.token_manager.get_quota_exceeded_keywords())
+            {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,

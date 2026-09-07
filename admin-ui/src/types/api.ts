@@ -46,6 +46,19 @@ export interface SuccessResponse {
   message: string
 }
 
+// 缓存 usage 模拟设置
+export interface CacheSimSettings {
+  enabled: boolean
+  creationRatio: number   // 0..1
+  hitRatio: number        // 0..1
+  cacheableRatio: number  // 0..1
+}
+
+// 额度用尽判定关键词
+export interface QuotaKeywordsResponse {
+  keywords: string[]
+}
+
 // 错误响应
 export interface AdminErrorResponse {
   error: {

@@ -5,9 +5,25 @@
 use std::collections::HashMap;
 
 use serde_json::json;
-use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+use crate::model::cache_sim::{self, CacheSimSettings, CacheTtl};
+
+/// 生成符合 Anthropic 官方格式的 message id
+///
+/// 官方格式为 `msg_` + 24 位 base62 字符，惯例以 `01` 开头，
+/// 例如 `msg_01XFDUDYJgAACzvnptvVoYEL`（而非基于 UUID 的 32 位十六进制串）。
+pub fn generate_message_id() -> String {
+    format!("msg_01{}", generate_base62(22))
+}
+
+/// 生成指定长度的 base62（大小写字母 + 数字）随机字符串
+fn generate_base62(len: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    (0..len)
+        .map(|_| CHARSET[fastrand::usize(..CHARSET.len())] as char)
+        .collect()
+}
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -458,6 +474,7 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        thinking_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -488,7 +505,10 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
+                        "output_tokens": output_tokens,
+                        "output_tokens_details": {
+                            "thinking_tokens": thinking_tokens
+                        }
                     }
                 }),
             ));
@@ -507,8 +527,6 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
-
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -519,10 +537,10 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
-    /// 从 contextUsageEvent 计算的实际输入 tokens
-    pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// thinking tokens 累计（用于 message_delta 的 output_tokens_details）
+    pub thinking_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -542,6 +560,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 缓存 usage 模拟上下文（请求带 cache_control 时为 Some）
+    pub cache_sim: Option<(CacheSimSettings, CacheTtl)>,
 }
 
 impl StreamContext {
@@ -555,10 +575,10 @@ impl StreamContext {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
-            message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            message_id: generate_message_id(),
             input_tokens,
-            context_input_tokens: None,
             output_tokens: 0,
+            thinking_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -568,11 +588,41 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            cache_sim: None,
         }
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        // 构建 usage：缓存字段永远输出（未命中为 0），对齐官方流式 message_start 结构。
+        // input 侧信息在 message_start 定稿；output 侧最终值在 message_delta。
+        let mut usage = match self
+            .cache_sim
+            .as_ref()
+            .and_then(|(settings, ttl)| cache_sim::simulate(settings, *ttl, self.input_tokens))
+        {
+            Some(cache_usage) => {
+                // 命中模拟：input_tokens 被拆分覆写，缓存字段由 apply_to_usage 注入
+                let mut u = json!({ "output_tokens": 1 });
+                cache_usage.apply_to_usage(&mut u);
+                u
+            }
+            None => json!({
+                "input_tokens": self.input_tokens,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 1
+            }),
+        };
+        if let Some(obj) = usage.as_object_mut() {
+            obj.insert("service_tier".to_string(), json!("standard"));
+            obj.insert("inference_geo".to_string(), json!("not_available"));
+        }
+
         json!({
             "type": "message_start",
             "message": {
@@ -583,10 +633,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": usage
             }
         })
     }
@@ -636,21 +683,16 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
-                self.context_input_tokens = Some(actual_input_tokens);
-                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                // 仅用于检测上下文窗口是否已满；input_tokens 仍上报本地估算值（方案 B）。
+                // contextUsageEvent 的百分比含 Kiro 内置系统提示词等代理外内容，
+                // 直接换算会让 input_tokens 虚高，与 Claude API 语义（仅用户输入）不符。
                 if context_usage.context_usage_percentage >= 100.0 {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                    context_usage.context_usage_percentage,
-                    actual_input_tokens
+                    "收到 contextUsageEvent: {}%（仅用于窗口判满，input_tokens 用本地估算）",
+                    context_usage.context_usage_percentage
                 );
                 Vec::new()
             }
@@ -901,8 +943,12 @@ impl StreamContext {
         events
     }
 
-    /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    /// 创建 thinking_delta 事件（同时累计 thinking tokens）
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        // 累计 thinking token（与 output 估算口径一致，约 4 字符/token）；空串不计
+        if !thinking.is_empty() {
+            self.thinking_tokens += (thinking.len() as i32 + 3) / 4;
+        }
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1082,8 +1128,9 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
+                        let remaining_thinking = self.thinking_buffer.clone();
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &remaining_thinking),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
@@ -1117,14 +1164,15 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // input_tokens 上报本地估算值（仅用户输入），不被 contextUsageEvent 覆盖（方案 B）
+        let final_input_tokens = self.input_tokens;
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        events.extend(self.state_manager.generate_final_events(
+            final_input_tokens,
+            self.output_tokens,
+            self.thinking_tokens,
+        ));
         events
     }
 }
@@ -1168,6 +1216,11 @@ impl BufferedStreamContext {
         }
     }
 
+    /// 设置缓存 usage 模拟上下文（请求带 cache_control 时）
+    pub fn set_cache_sim(&mut self, cache_sim: Option<(CacheSimSettings, CacheTtl)>) {
+        self.inner.cache_sim = cache_sim;
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1202,18 +1255,28 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
+        // input_tokens 上报本地估算值（仅用户输入），不被 contextUsageEvent 覆盖（方案 B）。
+        // 注：/cc 缓冲模式原本是为「等 contextUsageEvent 算准 input_tokens」而设计，
+        // 方案 B 下该理由已弱化；保留缓冲是因为 message_start 仍需在流结束后回填缓存字段。
+        let final_input_tokens = self.estimated_input_tokens;
 
-        // 更正 message_start 事件中的 input_tokens
+        // 用 input_tokens 计算缓存模拟拆分（若启用）
+        let cache_usage = self
+            .inner
+            .cache_sim
+            .as_ref()
+            .and_then(|(settings, ttl)| cache_sim::simulate(settings, *ttl, final_input_tokens));
+
+        // 回填 message_start 事件中的 usage（缓存字段永远都带，命中时由模拟覆写）
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        if let Some(cache_usage) = &cache_usage {
+                            cache_usage.apply_to_usage(usage);
+                        } else {
+                            usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        }
                     }
                 }
             }

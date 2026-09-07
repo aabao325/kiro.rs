@@ -109,6 +109,15 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// "额度用尽"判定关键词列表
+    ///
+    /// 上游 402 响应体只要包含列表中任意一个关键词（子串匹配），
+    /// 即判定为额度用尽，触发禁用凭据并切换。可在 Admin UI 中增删，
+    /// 用于应对官方随时可能更改的错误文案（如 MONTHLY_REQUEST_COUNT、
+    /// OVERAGE_REQUEST_LIMIT_EXCEEDED 等）。
+    #[serde(default = "default_quota_exceeded_keywords")]
+    pub quota_exceeded_keywords: Vec<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -159,6 +168,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_quota_exceeded_keywords() -> Vec<String> {
+    vec!["MONTHLY_REQUEST_COUNT".to_string()]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -184,6 +197,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            quota_exceeded_keywords: default_quota_exceeded_keywords(),
             config_path: None,
         }
     }

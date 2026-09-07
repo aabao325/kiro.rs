@@ -10,6 +10,10 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getCacheSimulation,
+  setCacheSimulation,
+  getQuotaKeywords,
+  setQuotaKeywords,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -115,6 +119,44 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取缓存 usage 模拟设置
+export function useCacheSimulation() {
+  return useQuery({
+    queryKey: ['cacheSimulation'],
+    queryFn: getCacheSimulation,
+  })
+}
+
+// 设置缓存 usage 模拟设置
+export function useSetCacheSimulation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheSimulation,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheSimulation'] })
+    },
+  })
+}
+
+// 获取额度用尽判定关键词
+export function useQuotaKeywords() {
+  return useQuery({
+    queryKey: ['quotaKeywords'],
+    queryFn: getQuotaKeywords,
+  })
+}
+
+// 设置额度用尽判定关键词
+export function useSetQuotaKeywords() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setQuotaKeywords,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['quotaKeywords'] })
     },
   })
 }
