@@ -25,6 +25,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
+  const [profileArn, setProfileArn] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
@@ -42,6 +43,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setAuthMethod('social')
     setAuthRegion('')
     setApiRegion('')
+    setProfileArn('')
     setClientId('')
     setClientSecret('')
     setPriority('0')
@@ -82,6 +84,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
+        profileArn: isApiKey ? undefined : profileArn.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
@@ -162,6 +165,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   onChange={(e) => setRefreshToken(e.target.value)}
                   disabled={isPending}
                 />
+              </div>
+            )}
+
+            {/* Profile ARN（OAuth 模式） */}
+            {!isApiKey && (
+              <div className="space-y-2">
+                <label htmlFor="profileArn" className="text-sm font-medium">
+                  Profile ARN
+                </label>
+                <Input
+                  id="profileArn"
+                  placeholder="arn:aws:codewhisperer:区域:账号:profile/标识"
+                  value={profileArn}
+                  onChange={(e) => setProfileArn(e.target.value)}
+                  disabled={isPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  KAM 导入会自动填写；IDE 聊天请求需要该字段
+                </p>
               </div>
             )}
 

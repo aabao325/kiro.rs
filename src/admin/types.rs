@@ -93,6 +93,9 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
+    /// Profile ARN（聊天请求需要，KAM 导入时位于账号顶层）
+    pub profile_arn: Option<String>,
+
     /// OIDC Client ID（IdC 认证需要）
     pub client_id: Option<String>,
 

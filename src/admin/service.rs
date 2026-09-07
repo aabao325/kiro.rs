@@ -209,6 +209,35 @@ impl AdminService {
         })
     }
 
+    fn credential_from_add_request(req: AddCredentialRequest) -> KiroCredentials {
+        KiroCredentials {
+            id: None,
+            access_token: None,
+            refresh_token: req.refresh_token,
+            profile_arn: req
+                .profile_arn
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            expires_at: None,
+            auth_method: Some(req.auth_method),
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            priority: req.priority,
+            region: req.region,
+            auth_region: req.auth_region,
+            api_region: req.api_region,
+            machine_id: req.machine_id,
+            email: req.email,
+            subscription_title: None,
+            proxy_url: req.proxy_url,
+            proxy_username: req.proxy_username,
+            proxy_password: req.proxy_password,
+            disabled: false,
+            kiro_api_key: req.kiro_api_key,
+            endpoint: req.endpoint,
+        }
+    }
+
     /// 添加新凭据
     pub async fn add_credential(
         &self,
@@ -227,31 +256,9 @@ impl AdminService {
             }
         }
 
-        // 构建凭据对象
+        // 构建凭据对象，并保留 Admin API / KAM 导入传入的 Profile ARN
         let email = req.email.clone();
-        let new_cred = KiroCredentials {
-            id: None,
-            access_token: None,
-            refresh_token: req.refresh_token,
-            profile_arn: None,
-            expires_at: None,
-            auth_method: Some(req.auth_method),
-            client_id: req.client_id,
-            client_secret: req.client_secret,
-            priority: req.priority,
-            region: req.region,
-            auth_region: req.auth_region,
-            api_region: req.api_region,
-            machine_id: req.machine_id,
-            email: req.email,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
-            disabled: false, // 新添加的凭据默认启用
-            kiro_api_key: req.kiro_api_key,
-            endpoint: req.endpoint,
-        };
+        let new_cred = Self::credential_from_add_request(req);
 
         // 调用 token_manager 添加凭据
         let credential_id = self
@@ -489,5 +496,27 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_credential_request_preserves_profile_arn() {
+        let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "test-refresh-token-value",
+            "authMethod": "idc",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/TESTPROFILE"
+        }))
+        .unwrap();
+
+        let credentials = AdminService::credential_from_add_request(request);
+
+        assert_eq!(
+            credentials.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/TESTPROFILE")
+        );
     }
 }
